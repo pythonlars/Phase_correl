@@ -14,7 +14,190 @@ Algorithms implemented:
 
 import math
 import sys
+import struct
+import zlib
 from typing import List, Tuple, Optional
+
+
+def paeth_predictor(a: int, b: int, c: int) -> int:
+    """
+    PNG Paeth filter predictor.
+
+    Computes the Paeth predictor for PNG filter type 4.
+    Returns the value (a, b, or c) that is closest to p = a + b - c.
+
+    Args:
+        a: Left pixel value
+        b: Above pixel value
+        c: Upper-left pixel value
+
+    Returns:
+        The predictor value (a, b, or c)
+    """
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+
+    if pa <= pb and pa <= pc:
+        return a
+    elif pb <= pc:
+        return b
+    else:
+        return c
+
+
+def load_png_grayscale(filename: str) -> Tuple[int, int, List[int]]:
+    """
+    Load PNG image and convert to grayscale.
+
+    Parses PNG file format using only Python standard library (struct, zlib).
+    Supports non-interlaced 8-bit RGBA PNGs. Converts to grayscale using
+    standard luminance formula: 0.299*R + 0.587*G + 0.114*B
+
+    Args:
+        filename: Path to PNG file
+
+    Returns:
+        Tuple of (width, height, grayscale_pixels)
+        where grayscale_pixels is a list of integers (0-255)
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file is not a valid PNG or unsupported format
+    """
+    with open(filename, 'rb') as f:
+        # Validate PNG signature
+        signature = f.read(8)
+        expected = b'\x89PNG\r\n\x1a\n'
+        if signature != expected:
+            raise ValueError(f"Not a valid PNG file: {filename}")
+
+        # Read chunks
+        width = height = 0
+        idat_chunks = []
+
+        while True:
+            # Read chunk header
+            chunk_length_bytes = f.read(4)
+            if len(chunk_length_bytes) < 4:
+                break
+            chunk_length = struct.unpack('>I', chunk_length_bytes)[0]
+            chunk_type = f.read(4)
+            chunk_data = f.read(chunk_length)
+            chunk_crc = f.read(4)  # Skip CRC validation for simplicity
+
+            if chunk_type == b'IHDR':
+                # Parse IHDR: width(4) height(4) bit_depth(1) color_type(1) ...
+                width, height, bit_depth, color_type = struct.unpack('>IIBBBBB', chunk_data)[:4]
+                if bit_depth != 8:
+                    raise ValueError(f"Only 8-bit PNGs supported (got {bit_depth}-bit)")
+                if color_type != 6:  # 6 = RGBA
+                    raise ValueError(f"Only RGBA PNGs supported (got color_type {color_type})")
+
+            elif chunk_type == b'IDAT':
+                idat_chunks.append(chunk_data)
+
+            elif chunk_type == b'IEND':
+                break
+
+        if width == 0 or height == 0:
+            raise ValueError("Invalid PNG: missing IHDR chunk")
+
+        if not idat_chunks:
+            raise ValueError("Invalid PNG: missing IDAT chunks")
+
+        # Concatenate and decompress IDAT chunks
+        compressed_data = b''.join(idat_chunks)
+        decompressed = zlib.decompress(compressed_data)
+
+        # PNG stores scanlines with filter byte prefix
+        bytes_per_pixel = 4  # RGBA
+        scanline_bytes = width * bytes_per_pixel
+        stride = scanline_bytes + 1  # +1 for filter byte
+
+        rgba_pixels = []
+        prev_scanline = [0] * scanline_bytes
+
+        for y in range(height):
+            offset = y * stride
+            filter_type = decompressed[offset]
+            scanline = list(decompressed[offset + 1 : offset + 1 + scanline_bytes])
+
+            # Reverse PNG filtering
+            if filter_type == 0:  # None
+                pass
+            elif filter_type == 1:  # Sub
+                for i in range(bytes_per_pixel, scanline_bytes):
+                    scanline[i] = (scanline[i] + scanline[i - bytes_per_pixel]) & 0xFF
+            elif filter_type == 2:  # Up
+                for i in range(scanline_bytes):
+                    scanline[i] = (scanline[i] + prev_scanline[i]) & 0xFF
+            elif filter_type == 3:  # Average
+                for i in range(scanline_bytes):
+                    left = scanline[i - bytes_per_pixel] if i >= bytes_per_pixel else 0
+                    above = prev_scanline[i]
+                    scanline[i] = (scanline[i] + ((left + above) // 2)) & 0xFF
+            elif filter_type == 4:  # Paeth
+                for i in range(scanline_bytes):
+                    left = scanline[i - bytes_per_pixel] if i >= bytes_per_pixel else 0
+                    above = prev_scanline[i]
+                    upper_left = prev_scanline[i - bytes_per_pixel] if i >= bytes_per_pixel else 0
+                    scanline[i] = (scanline[i] + paeth_predictor(left, above, upper_left)) & 0xFF
+
+            rgba_pixels.extend(scanline)
+            prev_scanline = scanline
+
+        # Convert RGBA to grayscale
+        grayscale_pixels = []
+        for i in range(0, len(rgba_pixels), 4):
+            r = rgba_pixels[i]
+            g = rgba_pixels[i + 1]
+            b = rgba_pixels[i + 2]
+            # Alpha channel (rgba_pixels[i + 3]) is ignored
+
+            # Standard luminance formula
+            gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+            grayscale_pixels.append(gray)
+
+        return (width, height, grayscale_pixels)
+
+
+def pad_image(pixels: List[int], old_width: int, old_height: int,
+              new_width: int, new_height: int) -> List[int]:
+    """
+    Pad image to new dimensions with black pixels.
+
+    Creates a new image of specified dimensions and copies the original
+    image to the top-left corner. Remaining pixels are filled with 0 (black).
+
+    Args:
+        pixels: Original image pixels in row-major order
+        old_width: Original image width
+        old_height: Original image height
+        new_width: Target width (must be >= old_width)
+        new_height: Target height (must be >= old_height)
+
+    Returns:
+        New list of pixels with dimensions new_width × new_height
+
+    Raises:
+        ValueError: If new dimensions are smaller than old dimensions
+    """
+    if new_width < old_width or new_height < old_height:
+        raise ValueError("New dimensions must be >= old dimensions")
+
+    # Create new image filled with black (0)
+    new_pixels = [0] * (new_width * new_height)
+
+    # Copy old pixels row by row
+    for y in range(old_height):
+        src_offset = y * old_width
+        dst_offset = y * new_width
+        for x in range(old_width):
+            new_pixels[dst_offset + x] = pixels[src_offset + x]
+
+    return new_pixels
 
 
 def radix2fft(input_arr: List[float], output: List[float], input_offset: int, output_offset: int, stride: int) -> None:
@@ -341,38 +524,78 @@ def compute_shift(image1: List[int], image2: List[int], width: int, height: int)
 
 def main() -> int:
     """
-    Main function demonstrating phase correlation shift detection.
+    Main function demonstrating phase correlation with real PNG images.
 
-    Creates two test images with known offset and computes the shift
-    between them using phase correlation.
+    Loads img1.png and img2.png, pads them to power-of-2 dimensions,
+    and computes the shift between them using phase correlation.
 
     Returns:
         0 on success, 1 on failure
     """
-    image1 = [0] * (256 * 128)
-    image2 = [0] * (256 * 128)
+    try:
+        # Load PNG images
+        print("Loading img1.png...")
+        width1, height1, pixels1 = load_png_grayscale("img1.png")
+        print(f"  Loaded: {width1}×{height1} pixels")
 
-    # Generate pair of images
-    for j in range(128):
-        for i in range(256):
-            offset = i + j * 256
-            if (i >= 16) and (i < 76) and (j >= 32) and (j < 92):
-                image1[offset] = 128
-            else:
-                image1[offset] = 0
+        print("Loading img2.png...")
+        width2, height2, pixels2 = load_png_grayscale("img2.png")
+        print(f"  Loaded: {width2}×{height2} pixels")
 
-            if (i >= 8) and (i < 68) and (j >= 40) and (j < 100):
-                image2[offset] = 16
-            else:
-                image2[offset] = 255
+        # Step 1: Pad img2 to match img1's height if needed
+        if height2 < height1:
+            print(f"\nPadding img2 from {width2}×{height2} to {width2}×{height1}...")
+            pixels2 = pad_image(pixels2, width2, height2, width2, height1)
+            height2 = height1
+        elif height1 < height2:
+            print(f"\nPadding img1 from {width1}×{height1} to {width1}×{height2}...")
+            pixels1 = pad_image(pixels1, width1, height1, width1, height2)
+            height1 = height2
 
-    ret, deltax, deltay = compute_shift(image1, image2, 256, 128)
-    if ret:
-        print("Operation failed", file=sys.stderr)
+        # Verify dimensions match
+        if width1 != width2 or height1 != height2:
+            print(f"Error: Image dimensions don't match after initial padding",
+                  file=sys.stderr)
+            print(f"  img1: {width1}×{height1}", file=sys.stderr)
+            print(f"  img2: {width2}×{height2}", file=sys.stderr)
+            return 1
+
+        print(f"Both images now: {width1}×{height1}")
+
+        # Step 2: Pad both to power-of-2 dimensions
+        # Find next power of 2
+        target_width = 1
+        while target_width < width1:
+            target_width <<= 1
+
+        target_height = 1
+        while target_height < height1:
+            target_height <<= 1
+
+        print(f"\nPadding to power-of-2: {target_width}×{target_height}...")
+        pixels1 = pad_image(pixels1, width1, height1, target_width, target_height)
+        pixels2 = pad_image(pixels2, width2, height2, target_width, target_height)
+
+        # Compute shift
+        print(f"\nComputing phase correlation shift...")
+        ret, deltax, deltay = compute_shift(pixels1, pixels2, target_width, target_height)
+
+        if ret:
+            print("Error: Phase correlation computation failed", file=sys.stderr)
+            return 1
+
+        print(f"\nCalculated shift: [{deltax}, {deltay}]")
+        return 0
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 1
-
-    print(f"Calculated shift: [{deltax}, {deltay}]")
-    return 0
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
