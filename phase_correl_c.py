@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-Phase Correlation implementation - Direct translation from C
+Phase Correlation implementation - NumPy-optimized version
 
-This module provides a direct line-by-line translation of the C implementation
-of phase correlation for image shift detection using FFT.
+This module provides a NumPy-optimized implementation of phase correlation
+for image shift detection using FFT.
 
-Algorithms implemented:
-- Radix-2 FFT (Decimation in Time)
-- Sum2FFT for combining FFT stages
-- 2D FFT for image processing
-- Normalized cross-correlation for phase detection
+The implementation uses NumPy's FFT functions for efficient computation
+while maintaining the exact same API as the original C-style implementation.
+
+Key functions:
+- compute_shift(): Compute translational shift between two images
+- load_png_grayscale(): Load PNG image to grayscale NumPy array
+- load_image(): Load image using PIL (with PNG fallback)
+- pad_image(): Pad image to specified dimensions
 """
 
 import math
 import sys
 import struct
 import zlib
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
+import numpy as np
+from numpy.typing import NDArray
+
+# Optional PIL/Pillow support for broader image format support
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 def paeth_predictor(a: int, b: int, c: int) -> int:
@@ -47,7 +59,7 @@ def paeth_predictor(a: int, b: int, c: int) -> int:
         return c
 
 
-def load_png_grayscale(filename: str) -> Tuple[int, int, List[int]]:
+def load_png_grayscale(filename: str) -> Tuple[int, int, NDArray[np.uint8]]:
     """
     Load PNG image and convert to grayscale.
 
@@ -60,7 +72,7 @@ def load_png_grayscale(filename: str) -> Tuple[int, int, List[int]]:
 
     Returns:
         Tuple of (width, height, grayscale_pixels)
-        where grayscale_pixels is a list of integers (0-255)
+        where grayscale_pixels is a NumPy array of uint8 (0-255)
 
     Raises:
         FileNotFoundError: If file doesn't exist
@@ -148,17 +160,12 @@ def load_png_grayscale(filename: str) -> Tuple[int, int, List[int]]:
             rgba_pixels.extend(scanline)
             prev_scanline = scanline
 
-        # Convert RGBA to grayscale
-        grayscale_pixels = []
-        for i in range(0, len(rgba_pixels), 4):
-            r = rgba_pixels[i]
-            g = rgba_pixels[i + 1]
-            b = rgba_pixels[i + 2]
-            # Alpha channel (rgba_pixels[i + 3]) is ignored
-
-            # Standard luminance formula
-            gray = int(0.299 * r + 0.587 * g + 0.114 * b)
-            grayscale_pixels.append(gray)
+        # Convert RGBA to grayscale using NumPy
+        rgba_array = np.array(rgba_pixels, dtype=np.float64).reshape(-1, 4)
+        # Standard luminance formula: 0.299*R + 0.587*G + 0.114*B
+        grayscale_pixels = (0.299 * rgba_array[:, 0] +
+                           0.587 * rgba_array[:, 1] +
+                           0.114 * rgba_array[:, 2]).astype(np.uint8)
 
         return (width, height, grayscale_pixels)
 
@@ -444,6 +451,9 @@ def compute_shift(image1: List[int], image2: List[int], width: int, height: int)
     Uses the phase correlation method to determine the translational
     offset between two images. Both width and height must be powers of 2.
 
+    This implementation uses NumPy's optimized FFT functions for efficient
+    computation while maintaining the same API as the original C-style version.
+
     Args:
         image1: First image as list of pixel values (0-255)
         image2: Second image as list of pixel values (0-255)
@@ -460,66 +470,45 @@ def compute_shift(image1: List[int], image2: List[int], width: int, height: int)
     if not width or (width & (width - 1)) or not height or (height & (height - 1)):
         return (-1, 0, 0)
 
-    ret = 0
-    deltax = 0
-    deltay = 0
-
-    # Allocate FFT buffers
     try:
-        fft_input1 = [0.0] * ((width * height) << 1)
-        fft_input2 = [0.0] * ((width * height) << 1)
-        fft_output = [0.0] * ((width * height) << 1)
-    except MemoryError:
+        # Convert input lists to NumPy 2D arrays with complex type
+        # image1 and image2 are in row-major order (height rows, width columns)
+        img1 = np.array(image1, dtype=np.complex128).reshape((height, width))
+        img2 = np.array(image2, dtype=np.complex128).reshape((height, width))
+
+        # Perform 2D FFT on each image using NumPy's optimized implementation
+        fft1 = np.fft.fft2(img1)
+        fft2 = np.fft.fft2(img2)
+
+        # Compute normalized cross power spectrum
+        # cross_power = fft1 * conj(fft2)
+        # normalized = exp(i * angle(cross_power)) - unit magnitude with phase difference
+        cross_power = fft1 * np.conj(fft2)
+        normalized = np.exp(1j * np.angle(cross_power))
+
+        # Perform inverse 2D FFT on obtained matrix
+        correlation = np.fft.ifft2(normalized)
+
+        # Search for peak using magnitude
+        magnitude = np.abs(correlation)
+        peak_idx = np.argmax(magnitude)
+        deltay, deltax = np.unravel_index(peak_idx, magnitude.shape)
+
+        # Convert to Python int for consistent return type
+        deltax = int(deltax)
+        deltay = int(deltay)
+
+        # Wrap around for negative shifts (values > half dimension are negative)
+        if deltax > (width >> 1):
+            deltax -= width
+        if deltay > (height >> 1):
+            deltay -= height
+
+        return (0, deltax, deltay)
+
+    except Exception:
+        # Handle any errors (memory allocation, array operations, etc.)
         return (-1, 0, 0)
-
-    # Convert image pixels to complex number format, use only real part
-    for i in range(width * height):
-        fft_input1[i << 1] = float(image1[i])
-        fft_input2[i << 1] = float(image2[i])
-
-        fft_input1[(i << 1) + 1] = 0.0
-        fft_input2[(i << 1) + 1] = 0.0
-
-    # Perform 2D FFT on each image
-    ret = fft2d(fft_input1, width, height, 0)
-    if ret:
-        return (ret, deltax, deltay)
-    ret = fft2d(fft_input2, width, height, 0)
-    if ret:
-        return (ret, deltax, deltay)
-
-    # Compute normalized cross power spectrum
-    for i in range(width * height):
-        comp_norm_cross_correlation(fft_input1, fft_input2, fft_output, i << 1, i << 1, i << 1)
-
-    # Perform inverse 2D FFT on obtained matrix
-    ret = fft2d(fft_output, width, height, 1)
-    if ret:
-        return (ret, deltax, deltay)
-
-    # Search for peak
-    offset = 0
-    max_val = 0.0
-    deltax = 0
-    deltay = 0
-    for j in range(height):
-        for i in range(width):
-            d = math.sqrt(pow(fft_output[offset << 1], 2) + pow(fft_output[(offset << 1) + 1], 2))
-            if d > max_val:
-                max_val = d
-                deltax = i
-                deltay = j
-            offset += 1
-
-    if deltax > width >> 1:
-        deltax -= width
-    if deltay > height >> 1:
-        deltay -= height
-
-    # clean:
-    # fft_input1, fft_input2, fft_output are automatically garbage collected (equivalent to free)
-
-    return (ret, deltax, deltay)
 
 
 def main() -> int:
@@ -536,31 +525,31 @@ def main() -> int:
         # Load PNG images
         print("Loading img1.png...")
         width1, height1, pixels1 = load_png_grayscale("img1.png")
-        print(f"  Loaded: {width1}×{height1} pixels")
+        print(f"  Loaded: {width1}x{height1} pixels")
 
         print("Loading img2.png...")
         width2, height2, pixels2 = load_png_grayscale("img2.png")
-        print(f"  Loaded: {width2}×{height2} pixels")
+        print(f"  Loaded: {width2}x{height2} pixels")
 
         # Step 1: Pad img2 to match img1's height if needed
         if height2 < height1:
-            print(f"\nPadding img2 from {width2}×{height2} to {width2}×{height1}...")
-            pixels2 = pad_image(pixels2, width2, height2, width2, height1)
+            print(f"\nPadding img2 from {width2}x{height2} to {width2}x{height1}...")
+            pixels2 = pad_image(list(pixels2), width2, height2, width2, height1)
             height2 = height1
         elif height1 < height2:
-            print(f"\nPadding img1 from {width1}×{height1} to {width1}×{height2}...")
-            pixels1 = pad_image(pixels1, width1, height1, width1, height2)
+            print(f"\nPadding img1 from {width1}x{height1} to {width1}x{height2}...")
+            pixels1 = pad_image(list(pixels1), width1, height1, width1, height2)
             height1 = height2
 
         # Verify dimensions match
         if width1 != width2 or height1 != height2:
             print(f"Error: Image dimensions don't match after initial padding",
                   file=sys.stderr)
-            print(f"  img1: {width1}×{height1}", file=sys.stderr)
-            print(f"  img2: {width2}×{height2}", file=sys.stderr)
+            print(f"  img1: {width1}x{height1}", file=sys.stderr)
+            print(f"  img2: {width2}x{height2}", file=sys.stderr)
             return 1
 
-        print(f"Both images now: {width1}×{height1}")
+        print(f"Both images now: {width1}x{height1}")
 
         # Step 2: Pad both to power-of-2 dimensions
         # Find next power of 2
@@ -572,9 +561,9 @@ def main() -> int:
         while target_height < height1:
             target_height <<= 1
 
-        print(f"\nPadding to power-of-2: {target_width}×{target_height}...")
-        pixels1 = pad_image(pixels1, width1, height1, target_width, target_height)
-        pixels2 = pad_image(pixels2, width2, height2, target_width, target_height)
+        print(f"\nPadding to power-of-2: {target_width}x{target_height}...")
+        pixels1 = pad_image(list(pixels1), width1, height1, target_width, target_height)
+        pixels2 = pad_image(list(pixels2), width2, height2, target_width, target_height)
 
         # Compute shift
         print(f"\nComputing phase correlation shift...")
